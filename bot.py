@@ -1,10 +1,11 @@
 # bot.py
 # ------------------------------------------------------------
 # Discord 多人同步記帳機器人（v2）
-# 這版新增：
-# 1) on_ready 會對所有已加入的 guild 立即 sync 指令（免等待全球傳播）
-# 2) on_guild_join 新加入伺服器也立即 sync
-# 3) 全域錯誤攔截 on_app_command_error，避免 silent fail
+# 重點：
+# - 新增 /between：查兩位成員之間的款項狀況（任何人可查）
+# - 只註冊 guild-level 指令（即時生效），並清空全域指令避免殘留
+# - 保留 /owe、/paid、/balance、/history、/undo
+# - 自動清理已下架指令名稱（/lent、/split_equal）
 # ------------------------------------------------------------
 
 import asyncio
@@ -17,6 +18,9 @@ from discord import app_commands
 from discord.ext import commands
 import aiosqlite
 
+from discord.ext import tasks
+from itertools import cycle
+
 DB_PATH = os.getenv("LEDGER_DB", "ledger.db")
 DEFAULT_CCY = os.getenv("DEFAULT_CCY", "TWD")
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -24,7 +28,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 INTENTS = discord.Intents.default()
 INTENTS.message_content = False
 INTENTS.members = True
-
+INTENTS.presences = True
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 SQL_INIT = """
@@ -139,156 +143,71 @@ async def recent_entries(guild_id: int, a_id: int, b_id: Optional[int], limit: i
             )
         return await cur.fetchall()
 
-# --------------------- 啟動 & 同步 ---------------------
+# 撤銷工具：刪除「此頻道」你自己上一筆
+async def pop_last_entry(guild_id: int, channel_id: int, created_by: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            """
+            SELECT id, creditor_id, debtor_id, amount_cents, currency, kind, note, created_at
+            FROM ledger
+            WHERE guild_id=? AND channel_id=? AND created_by=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id, channel_id, created_by)
+        )
+        row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return None
+        await db.execute("DELETE FROM ledger WHERE id=?", (row[0],))
+        await db.commit()
+        return row
 
-@bot.event
-async def on_ready():
-    await init_db()
-    try:
-        global_synced = await bot.tree.sync()
-        print(f"Global synced {len(global_synced)} commands")
-    except Exception as e:
-        print("Global command sync failed:", e)
-    for g in bot.guilds:
-        try:
-            synced = await bot.tree.sync(guild=g)
-            print(f"Guild {g.id} synced {len(synced)} commands")
-        except Exception as ge:
-            print(f"Guild sync failed for {g.id}:", ge)
-    print(f"Logged in as {bot.user}")
+# --------------------- 斜線指令 ---------------------
 
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-    try:
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Joined {guild.id}, guild-synced {len(synced)} commands")
-    except Exception as e:
-        print(f"on_guild_join sync failed for {guild.id}:", e)
-
-# 全域錯誤攔截，避免 silent fail
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: Exception):
-    try:
-        print("Slash command error:", repr(error))
-        if interaction.response.is_done():
-            await interaction.followup.send(f"❌ 指令錯誤：{error}", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"❌ 指令錯誤：{error}", ephemeral=True)
-    except Exception as e:
-        print("Failed to send error message:", e)
-
-# --------------------- Slash Commands ---------------------
-
+@app_commands.guild_only()
 @bot.tree.command(name="owe", description="我欠對方金額（建立債務）")
-@app_commands.describe(
-    user="對方（被欠錢的人）",
-    amount="金額（例如 120 或 120.50）",
-    note="備註"
-)
-async def owe(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    amount: str,
-    note: Optional[str] = None
-):
+@app_commands.describe(user="對方（被欠錢的人）", amount="金額（例如 120 或 120.50）", note="備註")
+async def owe(interaction: discord.Interaction, user: discord.Member, amount: str, note: Optional[str] = None):
     try:
         cents = await parse_amount_to_cents(amount)
         entry_id = await add_entry(
-            guild_id=interaction.guild_id,
-            channel_id=interaction.channel_id,
-            creditor_id=user.id,
-            debtor_id=interaction.user.id,
-            amount_cents=cents,
-            currency=DEFAULT_CCY,
-            kind='debt',
-            note=note,
-            created_by=interaction.user.id
+            guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+            creditor_id=user.id, debtor_id=interaction.user.id,
+            amount_cents=cents, currency=DEFAULT_CCY, kind='debt', note=note, created_by=interaction.user.id
         )
         await interaction.response.send_message(
-            f"✅ 已記錄：你欠 {user.mention} {cents/100:.2f} {DEFAULT_CCY}（# {entry_id}）"
-            + (f"｜{note}" if note else "")
+            f"✅ 已記錄：你欠 {user.mention} {cents/100:.2f} {DEFAULT_CCY}（# {entry_id}）" + (f"｜{note}" if note else "")
         )
     except ValueError as ve:
         await interaction.response.send_message(f"❌ {ve}", ephemeral=True)
 
-
-@bot.tree.command(name="lent", description="我借給對方（對方欠我）")
-@app_commands.describe(
-    user="對方（欠你的人）",
-    amount="金額（例如 120 或 120.50）",
-    note="備註"
-)
-async def lent(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    amount: str,
-    note: Optional[str] = None
-):
-    try:
-        cents = await parse_amount_to_cents(amount)
-        entry_id = await add_entry(
-            guild_id=interaction.guild_id,
-            channel_id=interaction.channel_id,
-            creditor_id=interaction.user.id,
-            debtor_id=user.id,
-            amount_cents=cents,
-            currency=DEFAULT_CCY,
-            kind='debt',
-            note=note,
-            created_by=interaction.user.id
-        )
-        await interaction.response.send_message(
-            f"✅ 已記錄：{user.mention} 欠你 {cents/100:.2f} {DEFAULT_CCY}（# {entry_id}）"
-            + (f"｜{note}" if note else "")
-        )
-    except ValueError as ve:
-        await interaction.response.send_message(f"❌ {ve}", ephemeral=True)
-
-
+@app_commands.guild_only()
 @bot.tree.command(name="paid", description="我已支付給對方（減少債務）")
-@app_commands.describe(
-    user="給錢的對象",
-    amount="金額（例如 120 或 120.50）",
-    note="備註"
-)
-async def paid(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    amount: str,
-    note: Optional[str] = None
-):
+@app_commands.describe(user="給錢的對象", amount="金額（例如 120 或 120.50）", note="備註")
+async def paid(interaction: discord.Interaction, user: discord.Member, amount: str, note: Optional[str] = None):
     try:
         cents = await parse_amount_to_cents(amount)
         entry_id = await add_entry(
-            guild_id=interaction.guild_id,
-            channel_id=interaction.channel_id,
-            creditor_id=interaction.user.id,
-            debtor_id=user.id,
-            amount_cents=cents,
-            currency=DEFAULT_CCY,
-            kind='payment',
-            note=note or 'payment',
-            created_by=interaction.user.id
+            guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+            creditor_id=interaction.user.id, debtor_id=user.id,
+            amount_cents=cents, currency=DEFAULT_CCY, kind='payment', note=note or 'payment', created_by=interaction.user.id
         )
         await interaction.response.send_message(
-            f"💸 已記錄付款：{user.mention} ← {cents/100:.2f} {DEFAULT_CCY}（# {entry_id}）"
-            + (f"｜{note}" if note else "")
+            f"💸 已記錄付款：{user.mention} ← {cents/100:.2f} {DEFAULT_CCY}（# {entry_id}）" + (f"｜{note}" if note else "")
         )
     except ValueError as ve:
         await interaction.response.send_message(f"❌ {ve}", ephemeral=True)
 
-
+@app_commands.guild_only()
 @bot.tree.command(name="balance", description="查看與某人的淨額，或列出前幾名對手方")
 @app_commands.describe(user="可選，指定對象則顯示雙方淨額")
-async def balance(
-    interaction: discord.Interaction,
-    user: Optional[discord.Member] = None
-):
+async def balance(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     me = interaction.user
     if user and user.id == me.id:
         await interaction.response.send_message("🙂 自己與自己沒有債務。", ephemeral=True)
         return
-
     if user:
         net = await pair_net_cents(interaction.guild_id, me.id, user.id)
         if net == 0:
@@ -306,84 +225,174 @@ async def balance(
         lines = []
         for uid, net in rows:
             mention = f"<@{uid}>"
-            if net > 0:
-                lines.append(f"{mention} 淨欠你 {net/100:.2f} {DEFAULT_CCY}")
-            else:
-                lines.append(f"你淨欠 {mention} {abs(net)/100:.2f} {DEFAULT_CCY}")
+            lines.append(f"{mention} 淨欠你 {net/100:.2f} {DEFAULT_CCY}" if net > 0 else f"你淨欠 {mention} {abs(net)/100:.2f} {DEFAULT_CCY}")
         await interaction.response.send_message("📈 你的前幾名對手方：\n" + "\n".join(lines))
 
-
+@app_commands.guild_only()
 @bot.tree.command(name="history", description="查看最近的記錄")
 @app_commands.describe(user="可選，限定與此人之間", limit="筆數，預設 10")
-async def history(
-    interaction: discord.Interaction,
-    user: Optional[discord.Member] = None,
-    limit: Optional[int] = 10
-):
+async def history(interaction: discord.Interaction, user: Optional[discord.Member] = None, limit: Optional[int] = 10):
     limit = max(1, min(50, limit or 10))
     rows = await recent_entries(interaction.guild_id, interaction.user.id, user.id if user else None, limit)
     if not rows:
         await interaction.response.send_message("📝 尚無記錄。", ephemeral=True)
         return
+    def line(r):
+        _id, cred, debt, cents, ccy, kind, note, created_by, created_at = r
+        return f"#{_id} [{ccy}] {cents/100:.2f} {kind} | <@{debt}> → <@{cred}> | by <@{created_by}> | {created_at}" + (f" ｜{note}" if note else "")
+    await interaction.response.send_message("🧾 最近記錄：\n" + "\n".join(line(r) for r in rows))
+
+@app_commands.guild_only()
+@bot.tree.command(name="undo", description="撤銷你在此頻道上一筆建立的記錄")
+async def undo(interaction: discord.Interaction):
+    row = await pop_last_entry(interaction.guild_id, interaction.channel_id, interaction.user.id)
+    if not row:
+        await interaction.response.send_message("↩️ 沒有可撤銷的記錄（此頻道中你尚未建立過記錄）。", ephemeral=True)
+        return
+    _id, cred, debt, cents, ccy, kind, note, created_at = row
+    await interaction.response.send_message(
+        "↩️ 已撤銷上一筆：\n"
+        f"#{_id} [{ccy}] {cents/100:.2f} {kind} | <@{debt}> → <@{cred}> | {created_at}"
+        + (f" ｜{note}" if note else "")
+    )
+
+# 新增：/between 查兩人款項狀況
+@app_commands.guild_only()
+@bot.tree.command(name="between", description="查詢兩位成員之間的款項狀況（任何人可查）")
+@app_commands.describe(user_a="成員 A", user_b="成員 B", limit="附帶顯示最近筆數，預設 5")
+async def between(interaction: discord.Interaction, user_a: discord.Member, user_b: discord.Member, limit: Optional[int] = 5):
+    if user_a.id == user_b.id:
+        await interaction.response.send_message("🙂 請選擇兩個不同的成員。", ephemeral=True)
+        return
+
+    net = await pair_net_cents(interaction.guild_id, user_a.id, user_b.id)
+    if net == 0:
+        header = f"✅ {user_a.mention} 與 {user_b.mention} 之間已結清。"
+    elif net > 0:
+        header = f"📊 {user_b.mention} 淨欠 {user_a.mention} **{net/100:.2f} {DEFAULT_CCY}**"
+    else:
+        header = f"📊 {user_a.mention} 淨欠 {user_b.mention} **{abs(net)/100:.2f} {DEFAULT_CCY}**"
+
+    # 附帶最近紀錄
+    limit = max(1, min(20, limit or 5))
+    rows = await recent_entries(interaction.guild_id, user_a.id, user_b.id, limit)
+    if not rows:
+        await interaction.response.send_message(header + "\n（兩人之間尚無記錄）")
+        return
 
     def line(r):
         _id, cred, debt, cents, ccy, kind, note, created_by, created_at = r
-        sign = "→"
-        return (
-            f"#{_id} [{ccy}] {cents/100:.2f} {kind} | "
-            f"<@{debt}> {sign} <@{cred}> | by <@{created_by}> | {created_at}"
-            + (f" ｜{note}" if note else "")
-        )
+        return f"#{_id} [{ccy}] {cents/100:.2f} {kind} | <@{debt}> → <@{cred}> | by <@{created_by}> | {created_at}" + (f" ｜{note}" if note else "")
 
-    text = "\n".join(line(r) for r in rows)
-    await interaction.response.send_message("🧾 最近記錄：\n" + text)
+    body = "\n".join(line(r) for r in rows)
+    await interaction.response.send_message(header + "\n🧾 最近記錄：\n" + body)
 
+# --------------------- 指令清理 / 同步 ---------------------
 
-@bot.tree.command(name="split_equal", description="均分支出（由你先墊付）")
-@app_commands.describe(
-    total="總金額 (如 900 或 900.00)",
-    participants_mentions="輸入 @提及 的清單，例如：@A @B @C（不含自己）",
-    note="備註"
-)
-async def split_equal(
-    interaction: discord.Interaction,
-    total: str,
-    participants_mentions: str,
-    note: Optional[str] = None
-):
+REMOVED_CMD_NAMES = {"lent", "split_equal"}
+
+async def _purge_removed_commands_for_guild(app_id: int, guild_id: int, http):
     try:
-        total_cents = await parse_amount_to_cents(total)
-        ids = [int(x) for x in re.findall(r"<@!?([0-9]+)>", participants_mentions)]
-        ids = [i for i in ids if i != interaction.user.id]
-        unique_ids = sorted(set(ids))
-        if not unique_ids:
-            await interaction.response.send_message("請至少指定一位參與者（不含自己）", ephemeral=True)
-            return
+        guild_cmds = await http.get_guild_commands(app_id, guild_id)
+        for c in guild_cmds:
+            if c.get("name") in REMOVED_CMD_NAMES:
+                await http.delete_guild_command(app_id, guild_id, c["id"])
+                print(f"Deleted guild command /{c['name']} for guild {guild_id}")
+    except Exception as e:
+        print(f"Failed to purge guild({guild_id}) commands: {e}")
 
-        share = total_cents // len(unique_ids)
-        remainder = total_cents - share * len(unique_ids)
+async def _wipe_all_global_commands(app_id: int, http):
+    """以『空清單』bulk 覆寫全域斜線指令，徹底清掉殘留與快取。"""
+    try:
+        await http.bulk_upsert_global_commands(app_id, [])
+        print("Wiped ALL global commands.")
+    except Exception as e:
+        print(f"Failed to wipe global commands: {e}")
 
-        created = []
-        for idx, uid in enumerate(unique_ids):
-            cents = share + (1 if idx < remainder else 0)
-            entry_id = await add_entry(
-                guild_id=interaction.guild_id,
-                channel_id=interaction.channel_id,
-                creditor_id=interaction.user.id,
-                debtor_id=uid,
-                amount_cents=cents,
-                currency=DEFAULT_CCY,
-                kind='split',
-                note=note or f'split {total_cents/100:.2f} among {len(unique_ids)}',
-                created_by=interaction.user.id
-            )
-            created.append((uid, cents, entry_id))
+@bot.event
+async def on_ready():
+    await init_db()
+    try:
+        app_id = bot.application_id
 
-        lines = [f"<@{uid}> 欠你 {c/100:.2f} {DEFAULT_CCY}（# {eid}）" for uid, c, eid in created]
-        await interaction.response.send_message("🍰 已建立均分：\n" + "\n".join(lines))
-    except ValueError as ve:
-        await interaction.response.send_message(f"❌ {ve}", ephemeral=True)
+        # 0) 先清空全域指令，避免殘留與延遲
+        await _wipe_all_global_commands(app_id, bot.http)
 
+        # 1) 將程式中定義的指令複製到各 guild 並同步（guild-level 即時可用）
+        for g in bot.guilds:
+            guild_obj = discord.Object(id=g.id)
+            #（保險）清舊指令名稱
+            await _purge_removed_commands_for_guild(app_id, g.id, bot.http)
+            bot.tree.copy_global_to(guild=guild_obj)
+            synced = await bot.tree.sync(guild=guild_obj)
+            print(f"Guild {g.id} synced {len(synced)} commands: {[c.name for c in synced]}")
+
+        # 不呼叫全域 sync，避免再次建立全域指令
+    except Exception as e:
+        print("Command sync/cleanup failed:", e)
+
+    print(f"Logged in as {bot.user}")
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """新加入伺服器時：把定義複製到該 guild，並同步"""
+    try:
+        app_id = bot.application_id
+        await _purge_removed_commands_for_guild(app_id, guild.id, bot.http)
+        guild_obj = discord.Object(id=guild.id)
+        bot.tree.copy_global_to(guild=guild_obj)
+        synced = await bot.tree.sync(guild=guild_obj)
+        print(f"Joined {guild.id}, guild-synced {len(synced)} commands: {[c.name for c in synced]}")
+    except Exception as e:
+        print(f"on_guild_join sync failed for {guild.id}:", e)
+
+# --------------------- 錯誤攔截與狀態 ---------------------
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    try:
+        print("Slash command error:", repr(error))
+        if interaction.response.is_done():
+            await interaction.followup.send(f"❌ 指令錯誤：{error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ 指令錯誤：{error}", ephemeral=True)
+    except Exception as e:
+        print("Failed to send error message:", e)
+
+STATUS_ROTATIONS = [
+    "用 /owe /paid 記帳",
+    "查兩人：/between",
+    "撤銷：/undo",
+    "看淨額：/balance",
+    "看紀錄：/history",
+]
+_status_cycle = cycle(STATUS_ROTATIONS)
+
+@bot.listen('on_ready')
+async def _set_presence_and_start_task():
+    try:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Activity(type=discord.ActivityType.watching, name=next(_status_cycle))
+        )
+        if not _cycle_presence.is_running():
+            _cycle_presence.start()
+    except Exception as e:
+        print("Presence setup failed:", e)
+
+@tasks.loop(minutes=15)
+async def _cycle_presence():
+    try:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Activity(type=discord.ActivityType.watching, name=next(_status_cycle))
+        )
+    except Exception as e:
+        print("Presence update failed:", e)
+
+@_cycle_presence.before_loop
+async def _before_cycle_presence():
+    await bot.wait_until_ready()
 
 # --------------------- 入口 ---------------------
 
