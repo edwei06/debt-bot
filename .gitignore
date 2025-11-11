@@ -1,0 +1,57 @@
+# === Secrets / Env ===
+.env
+.env.local
+.env.*            # e.g. .env.prod, .env.dev
+!.env.example     # keep a template in repo
+.envrc
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+env/
+
+# Packaging / metadata
+build/
+dist/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+*.egg
+
+# Testing / tooling caches
+.pytest_cache/
+.mypy_cache/
+.tox/
+.pyre/
+.pyright/
+.cache/
+.coverage*
+coverage.xml
+htmlcov/
+
+# === Logs ===
+logs/
+*.log
+!logs/.gitkeep     # keep folder if you add a placeholder
+
+# === SQLite DB / App state ===
+*.sqlite
+*.sqlite3
+
+# === Editors / OS junk ===
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Docker (local overrides) ===
+docker-compose.override.yml
